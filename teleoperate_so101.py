@@ -3,18 +3,17 @@ from lerobot.teleoperators.so101_leader import SO101LeaderConfig, SO101Leader
 from lerobot.robots.so101_follower import SO101FollowerConfig, SO101Follower
 
 camera_config = {
-    "wrist": OpenCVCameraConfig(index_or_path="/dev/video4", width=640, height=480, fps=30)
+    #"wrist": OpenCVCameraConfig(index_or_path="/dev/video4", width=640, height=480, fps=30)
 }
 
 robot_config = SO101FollowerConfig(
     port="/dev/ttyACM1",
-    id="toms_follower_arm",
-    cameras=camera_config
+    id="ingenieursproject2_follower",
 )
 
 teleop_config = SO101LeaderConfig(
     port="/dev/ttyACM0",
-    id="toms_leader_arm",
+    id="ingenieursproject2_leader",
 )
 
 robot = SO101Follower(robot_config)
