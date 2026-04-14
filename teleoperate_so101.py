@@ -6,14 +6,25 @@ camera_config = {
     #"wrist": OpenCVCameraConfig(index_or_path="/dev/video4", width=640, height=480, fps=30)
 }
 
+# robot_config = SO101FollowerConfig(
+#     port="/dev/ttyACM1",
+#     id="ingenieursproject2_follower",
+# )
+
+# teleop_config = SO101LeaderConfig(
+#     port="/dev/ttyACM1",
+#     id="ingenieursproject2_leader",
+# )
+
 robot_config = SO101FollowerConfig(
     port="/dev/ttyACM1",
-    id="ingenieursproject2_follower",
+    id="toms_follower_arm", 
 )
 
+# ---- Add the correct leader port in the config ----
 teleop_config = SO101LeaderConfig(
-    port="/dev/ttyACM0",
-    id="ingenieursproject2_leader",
+    port="/dev/ttyACM0",  
+    id="toms_leader_arm",
 )
 
 robot = SO101Follower(robot_config)

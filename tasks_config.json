@@ -1,0 +1,19 @@
+{
+    "policy_type": "act",
+    "training_steps": 100000,
+    "batch_size": 8,
+    "tasks": [
+        {
+            "name": "Pick up the cup",
+            "description": "Grab the cup from the table and lift it up",
+            "required_episodes": 3,
+            "max_episode_time_s": 60
+        },
+        {
+            "name": "Place cup on saucer",
+            "description": "Pick up the cup and place it on the saucer",
+            "required_episodes": 50,
+            "max_episode_time_s": 60
+        }
+    ]
+}

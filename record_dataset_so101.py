@@ -16,33 +16,35 @@ from sensing_so101_with_button import SO101FollowerWithTouch
 import time
 import datetime
 
-NUM_EPISODES = 2
-FPS = 30
-EPISODE_TIME_SEC = 600
-TASK_DESCRIPTION = "Make me a coffee"
+NUM_EPISODES =    2 
+FPS = 30    
+EPISODE_TIME_SEC = 600    
+TASK_DESCRIPTION = "Make me a coffee"  
 
 # Create the robot and teleoperator configurations
 # ---- Add the correct video path in the config ----
 camera_config = {
-    "wrist": OpenCVCameraConfig(index_or_path="/dev/video4", width=640, height=480, fps=30)
+   "scene_side": OpenCVCameraConfig(index_or_path="/dev/video4", width=640, height=480, fps=30),
+   "scene_top": OpenCVCameraConfig(index_or_path="/dev/video6", width=640, height=480, fps=30)
 }
-
-# ---- Add the correct follower port in the config ----
+ 
+ # ---- Add the correct follower port in the config ----
 robot_config = SO101FollowerConfig(
-    port="/dev/ttyACM6",
+    port="/dev/ttyACM2",
     id="toms_follower_arm", 
     cameras=camera_config
 )
 
 # ---- Add the correct leader port in the config ----
 teleop_config = SO101LeaderConfig(
-    port="/dev/ttyACM0", 
-    id="toms_leader_arm",
+    port="/dev/ttyACM1",  
+    id="toms_leader_arm"
 )
 
 # Initialize the robot and teleoperator
 # ---- Add the correct microcontroller port in the config ----
-robot = SO101FollowerWithTouch(robot_config, sensor_serial_port="/dev/ttyACM1")
+
+robot = SO101FollowerWithTouch(robot_config, sensor_serial_port="/dev/ttyACM0" )
 teleop_device = SO101Leader(teleop_config)
 
 # Configure the dataset features
