@@ -13,6 +13,7 @@ Usage:
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -94,18 +95,32 @@ def save_task_state(state_path: Path, task_state: dict):
         json.dump(task_state, f, indent=2)
 
 
+# Cache of open datasets, keyed by task name
+_dataset_cache: dict[str, LeRobotDataset] = {}
+
+
 def get_or_create_dataset(task_name: str, dataset_features: dict, robot_name: str) -> LeRobotDataset:
-    """Get an existing dataset for a task or create a new one."""
+    """Get an existing dataset for a task or create a new one. Cached per task."""
+    if task_name in _dataset_cache:
+        return _dataset_cache[task_name]
+
     root = get_task_data_root(task_name)
     safe_name = task_name.lower().replace(" ", "_").replace("/", "_")
     repo_id = f"local/{safe_name}"
 
-    if (root / "meta").exists():
-        # Dataset already exists, open it for appending
-        return LeRobotDataset(repo_id=repo_id, root=root)
+    # Check if a previous session left a finalized dataset (with episodes parquet)
+    episodes_dir = root / "meta" / "episodes"
+    has_saved_episodes = episodes_dir.exists() and any(episodes_dir.glob("*.parquet"))
+
+    if has_saved_episodes:
+        # Reopen the existing dataset for appending
+        dataset = LeRobotDataset(repo_id=repo_id, root=root)
     else:
-        # Create a new dataset
-        return LeRobotDataset.create(
+        # Either no dataset exists, or a previous session created the dir
+        # but never saved any episodes. Clean up the incomplete dir and start fresh.
+        if root.exists():
+            shutil.rmtree(root)
+        dataset = LeRobotDataset.create(
             repo_id=repo_id,
             fps=FPS,
             root=root,
@@ -114,6 +129,9 @@ def get_or_create_dataset(task_name: str, dataset_features: dict, robot_name: st
             use_videos=True,
             image_writer_threads=4,
         )
+
+    _dataset_cache[task_name] = dataset
+    return dataset
 
 
 def recording_thread(robot, teleop_device, events, gui, task_configs, task_state, dataset_features, state_path):
@@ -200,8 +218,12 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
             gui.notify_episode_discarded()
             continue
 
-        # Save the episode
+        # Save the episode and finalize to flush parquet writers.
+        # This ensures data is valid on disk even if the app crashes.
         dataset.save_episode()
+        dataset.finalize()
+        # Remove from cache so it gets re-opened fresh for the next episode
+        _dataset_cache.pop(task_name, None)
         log_say(f"Episode saved for: {task_name}")
         gui.notify_episode_saved()
 
@@ -214,7 +236,17 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
             ts.get("episodes_collected", 0) >= task_cfg["required_episodes"]
             and ts.get("training_status", "not_started") == "not_started"
         ):
+            # Finalize the dataset so parquet metadata is flushed to disk
+            # before the training subprocess tries to read it.
+            if task_name in _dataset_cache:
+                _dataset_cache[task_name].finalize()
+                _dataset_cache.pop(task_name)
             _start_background_training(task_name, task_cfg, task_state, state_path)
+
+    # Finalize all open datasets on exit
+    for ds in _dataset_cache.values():
+        ds.finalize()
+    _dataset_cache.clear()
 
     # Cleanup
     log_say("Stopping...")
@@ -292,7 +324,7 @@ def _start_background_training(task_name: str, task_cfg: dict, task_state: dict,
 def _training_worker(task_name: str, task_cfg: dict, task_state: dict, state_path: Path):
     """Run lerobot-train in a subprocess."""
     data_root = get_task_data_root(task_name)
-    output_dir = get_task_output_dir(task_name)
+    output_dir = Path(get_task_output_dir(task_name))
     safe_name = task_name.lower().replace(" ", "_").replace("/", "_")
     repo_id = f"local/{safe_name}"
 
@@ -306,14 +338,25 @@ def _training_worker(task_name: str, task_cfg: dict, task_state: dict, state_pat
         f"--dataset.repo_id={repo_id}",
         f"--dataset.root={data_root}",
         f"--policy.type={policy_type}",
+        f"--policy.push_to_hub=false",
         f"--output_dir={output_dir}",
         f"--steps={training_steps}",
         f"--batch_size={batch_size}",
     ]
 
+    # Write training logs for debugging
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "train.log"
+
     log_say(f"Starting training for: {task_name}")
+    log_say(f"Training log: {log_file}")
     try:
+        with open(log_file, "w") as lf:
+            lf.write(f"Command: {' '.join(cmd)}\n\n")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=86400)
+        with open(log_file, "a") as lf:
+            lf.write(f"--- STDOUT ---\n{result.stdout}\n\n--- STDERR ---\n{result.stderr}\n")
         if result.returncode == 0:
             # Find the last checkpoint
             checkpoint_dir = _find_latest_checkpoint(output_dir)
