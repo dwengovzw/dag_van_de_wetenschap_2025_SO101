@@ -2,6 +2,9 @@
     "policy_type": "act",
     "training_steps": 100000,
     "batch_size": 8,
+    "training_mode": "local",
+    "remote_server_url": "http://gpu-server:5000",
+    "remote_api_key": "change-me-to-a-secret",
     "tasks": [
         {
             "name": "Pick up the cup",
@@ -14,6 +17,12 @@
             "description": "Pick up the cup and place it on the saucer",
             "required_episodes": 50,
             "max_episode_time_s": 60
+        },
+        {
+            "name": "Put the ball into the cup",
+            "description": "Pick up the ball and place it into the cup",
+            "required_episodes": 5,
+            "max_episode_time_s": 40
         }
     ]
 }

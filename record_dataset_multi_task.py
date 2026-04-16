@@ -16,10 +16,13 @@ import json
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import argparse
 from pathlib import Path
+
+import requests
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -61,6 +64,13 @@ teleop_config = SO101LeaderConfig(
 )
 
 # ===== End Hardware Configuration =====
+
+# Remote training configuration (set from config file in main())
+_training_config = {
+    "training_mode": "local",
+    "remote_server_url": "",
+    "remote_api_key": "",
+}
 
 
 def load_task_config(config_path: str) -> dict:
@@ -218,12 +228,10 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
             gui.notify_episode_discarded()
             continue
 
-        # Save the episode and finalize to flush parquet writers.
-        # This ensures data is valid on disk even if the app crashes.
+        # Save the episode (data is appended to the open parquet writer).
+        # Don't finalize here — closing the writer and re-opening for the next
+        # episode would overwrite the parquet file.
         dataset.save_episode()
-        dataset.finalize()
-        # Remove from cache so it gets re-opened fresh for the next episode
-        _dataset_cache.pop(task_name, None)
         log_say(f"Episode saved for: {task_name}")
         gui.notify_episode_saved()
 
@@ -308,13 +316,18 @@ def _run_policy(task_name, robot, events, gui, task_state, robot_action_processo
 
 
 def _start_background_training(task_name: str, task_cfg: dict, task_state: dict, state_path: Path):
-    """Launch policy training as a background subprocess."""
+    """Launch policy training locally or remotely based on config."""
     ts = task_state.setdefault(task_name, {})
     ts["training_status"] = "training"
     save_task_state(state_path, task_state)
 
+    if _training_config["training_mode"] == "remote":
+        target = _remote_training_worker
+    else:
+        target = _training_worker
+
     thread = threading.Thread(
-        target=_training_worker,
+        target=target,
         args=(task_name, task_cfg, task_state, state_path),
         daemon=True,
     )
@@ -344,10 +357,9 @@ def _training_worker(task_name: str, task_cfg: dict, task_state: dict, state_pat
         f"--batch_size={batch_size}",
     ]
 
-    # Write training logs for debugging
-    log_dir = output_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "train.log"
+    # Write training log next to the dataset, NOT inside output_dir
+    # (lerobot-train fails if output_dir already exists)
+    log_file = data_root / "train.log"
 
     log_say(f"Starting training for: {task_name}")
     log_say(f"Training log: {log_file}")
@@ -382,6 +394,119 @@ def _training_worker(task_name: str, task_cfg: dict, task_state: dict, state_pat
         task_state.setdefault(task_name, {})["training_status"] = "failed"
         save_task_state(state_path, task_state)
         log_say(f"Training error for {task_name}: {e}")
+
+
+def _safe_tar_extract(tar: tarfile.TarFile, dest: Path):
+    """Extract tar safely, preventing path traversal attacks."""
+    dest = dest.resolve()
+    for member in tar.getmembers():
+        member_path = (dest / member.name).resolve()
+        if not str(member_path).startswith(str(dest)):
+            raise ValueError(f"Path traversal detected in tar member: {member.name}")
+    tar.extractall(dest)
+
+
+def _remote_training_worker(task_name: str, task_cfg: dict, task_state: dict, state_path: Path):
+    """Upload dataset to remote server, poll for completion, download policy."""
+    server_url = _training_config["remote_server_url"].rstrip("/")
+    api_key = _training_config["remote_api_key"]
+    headers = {"X-API-Key": api_key}
+
+    data_root = get_task_data_root(task_name)
+    output_dir = Path(get_task_output_dir(task_name))
+    ts = task_state.setdefault(task_name, {})
+
+    job_id = ts.get("remote_job_id")
+
+    # If no existing job, upload dataset and create one
+    if not job_id:
+        log_say(f"Uploading dataset for remote training: {task_name}")
+        tar_path = data_root / "dataset_upload.tar.gz"
+        try:
+            with tarfile.open(tar_path, "w:gz") as tar:
+                tar.add(str(data_root), arcname="dataset")
+
+            with open(tar_path, "rb") as f:
+                resp = requests.post(
+                    f"{server_url}/jobs",
+                    files={"dataset": ("dataset.tar.gz", f, "application/gzip")},
+                    data={
+                        "task_name": task_name,
+                        "policy_type": task_cfg.get("policy_type", "act"),
+                        "training_steps": str(task_cfg.get("training_steps", 100000)),
+                        "batch_size": str(task_cfg.get("batch_size", 8)),
+                    },
+                    headers=headers,
+                    timeout=600,
+                )
+            resp.raise_for_status()
+            job_id = resp.json()["job_id"]
+            ts["remote_job_id"] = job_id
+            save_task_state(state_path, task_state)
+            log_say(f"Remote training job submitted: {job_id}")
+        except Exception as e:
+            log_say(f"Failed to submit remote training for {task_name}: {e}")
+            ts["training_status"] = "failed"
+            save_task_state(state_path, task_state)
+            return
+        finally:
+            tar_path.unlink(missing_ok=True)
+
+    # Poll for completion
+    log_say(f"Polling remote training status for: {task_name} (job {job_id})")
+    while True:
+        time.sleep(30)
+        try:
+            resp = requests.get(f"{server_url}/jobs/{job_id}", headers=headers, timeout=30)
+            resp.raise_for_status()
+            status = resp.json()["status"]
+        except Exception as e:
+            log_say(f"Remote status check failed (will retry): {e}")
+            continue
+
+        if status == "completed":
+            break
+        elif status == "failed":
+            log_say(f"Remote training failed for: {task_name}")
+            ts["training_status"] = "failed"
+            ts.pop("remote_job_id", None)
+            save_task_state(state_path, task_state)
+            return
+
+    # Download trained policy
+    log_say(f"Downloading trained policy for: {task_name}")
+    policy_tar_path = data_root / "policy_download.tar.gz"
+    try:
+        resp = requests.get(
+            f"{server_url}/jobs/{job_id}/policy",
+            headers=headers,
+            stream=True,
+            timeout=600,
+        )
+        resp.raise_for_status()
+        with open(policy_tar_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(policy_tar_path, "r:gz") as tar:
+            _safe_tar_extract(tar, output_dir)
+
+        checkpoint = _find_latest_checkpoint(output_dir)
+        if checkpoint:
+            ts["training_status"] = "trained"
+            ts["policy_path"] = str(checkpoint)
+            log_say(f"Remote training complete for: {task_name}")
+        else:
+            ts["training_status"] = "failed"
+            log_say(f"Policy downloaded but no checkpoint found for: {task_name}")
+    except Exception as e:
+        log_say(f"Failed to download policy for {task_name}: {e}")
+        ts["training_status"] = "failed"
+    finally:
+        ts.pop("remote_job_id", None)
+        save_task_state(state_path, task_state)
+        policy_tar_path.unlink(missing_ok=True)
 
 
 def _find_latest_checkpoint(output_dir: Path) -> Path | None:
@@ -449,6 +574,25 @@ def main():
                 ts["policy_path"] = str(checkpoint)
 
     save_task_state(state_path, task_state)
+
+    # Set up training mode config
+    _training_config["training_mode"] = config.get("training_mode", "local")
+    _training_config["remote_server_url"] = config.get("remote_server_url", "")
+    _training_config["remote_api_key"] = config.get("remote_api_key", "")
+
+    # Resume polling for any in-progress remote training jobs
+    if _training_config["training_mode"] == "remote":
+        for task in task_configs:
+            name = task["name"]
+            ts = task_state[name]
+            if ts.get("training_status") == "training" and ts.get("remote_job_id"):
+                log_say(f"Resuming remote training poll for: {name}")
+                thread = threading.Thread(
+                    target=_remote_training_worker,
+                    args=(name, task, task_state, state_path),
+                    daemon=True,
+                )
+                thread.start()
 
     # Initialize robot and teleoperator
     robot = SO101FollowerWithTouch(robot_config, sensor_serial_port="/dev/ttyACM0")
