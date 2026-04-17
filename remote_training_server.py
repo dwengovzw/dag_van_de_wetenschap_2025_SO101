@@ -168,6 +168,22 @@ def get_job_status(job_id):
     })
 
 
+@app.route("/jobs/<job_id>/log", methods=["GET"])
+@require_api_key
+def get_job_log(job_id):
+    """Download the full training log for a job."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    log_file = WORK_DIR / job_id / "train.log"
+    if not log_file.exists():
+        return jsonify({"error": "No log file available yet"}), 404
+
+    return send_file(str(log_file), mimetype="text/plain")
+
+
 @app.route("/jobs/<job_id>/policy", methods=["GET"])
 @require_api_key
 def download_policy(job_id):

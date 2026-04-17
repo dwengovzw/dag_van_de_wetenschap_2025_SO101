@@ -67,6 +67,9 @@ class FaireMultiTaskGUI:
         self.task_list_frame = None
         self.recording_tip_label = None
         self._card_widgets = []  # Per-card mutable widget references
+        self._log_text = None  # Text widget for training log viewer
+        self._log_refresh_id = None
+        self._log_task_name = None
 
         self._build_ui()
 
@@ -243,6 +246,28 @@ class FaireMultiTaskGUI:
                 )
                 policy_btn.pack(side="left", padx=(0, 10))
 
+            # Train button — shown when not currently training
+            train_btn = None
+            if training_status not in ("training",):
+                train_btn = self._make_button(
+                    btn_row, "🧠 Train", COLORS["training"],
+                    lambda i=idx: self._on_start_training(i),
+                    font=self.font_small
+                )
+                train_btn.pack(side="left", padx=(0, 10))
+
+            # View log button — shown when a log exists
+            log_btn = None
+            safe_name = name.lower().replace(" ", "_").replace("/", "_")
+            log_exists = (self._get_data_dir() / safe_name / "train.log").exists()
+            if log_exists or training_status in ("training", "trained", "failed"):
+                log_btn = self._make_button(
+                    btn_row, "📄 Log", COLORS["accent"],
+                    lambda i=idx: self._show_training_log(i),
+                    font=self.font_small
+                )
+                log_btn.pack(side="left", padx=(0, 10))
+
             self._card_widgets.append({
                 "badge_label": badge_label,
                 "bar_bg": bar_bg,
@@ -250,6 +275,8 @@ class FaireMultiTaskGUI:
                 "progress_label": progress_label,
                 "btn_row": btn_row,
                 "policy_btn": policy_btn,
+                "train_btn": train_btn,
+                "log_btn": log_btn,
                 "idx": idx,
             })
 
@@ -307,6 +334,36 @@ class FaireMultiTaskGUI:
                     cw["policy_btn"].destroy()
                     cw["policy_btn"] = None
 
+            # Show/hide train button (hide while training is in progress)
+            if training_status in ("training",):
+                if cw["train_btn"] is not None:
+                    cw["train_btn"].destroy()
+                    cw["train_btn"] = None
+            else:
+                if cw["train_btn"] is None:
+                    cw["train_btn"] = self._make_button(
+                        cw["btn_row"], "🧠 Train", COLORS["training"],
+                        lambda i=idx: self._on_start_training(i),
+                        font=self.font_small
+                    )
+                    cw["train_btn"].pack(side="left", padx=(0, 10))
+
+            # Show/hide log button
+            safe_name = name.lower().replace(" ", "_").replace("/", "_")
+            log_exists = (self._get_data_dir() / safe_name / "train.log").exists()
+            if log_exists or training_status in ("training", "trained", "failed"):
+                if cw["log_btn"] is None:
+                    cw["log_btn"] = self._make_button(
+                        cw["btn_row"], "📄 Log", COLORS["accent"],
+                        lambda i=idx: self._show_training_log(i),
+                        font=self.font_small
+                    )
+                    cw["log_btn"].pack(side="left", padx=(0, 10))
+            else:
+                if cw["log_btn"] is not None:
+                    cw["log_btn"].destroy()
+                    cw["log_btn"] = None
+
         self._overview_refresh_id = self.root.after(2000, self._schedule_overview_refresh)
 
     def _select_task(self, task_idx, mode="collect"):
@@ -319,6 +376,113 @@ class FaireMultiTaskGUI:
             self._start_policy_execution()
         else:
             self._show_idle()
+
+    def _get_data_dir(self):
+        """Return the base data directory (matches DATA_DIR in record script)."""
+        from pathlib import Path
+        return Path("~/datasets").expanduser()
+
+    # ================================================================
+    # Training Controls
+    # ================================================================
+
+    def _on_start_training(self, task_idx):
+        """User clicked Train button for a task."""
+        task = self.task_configs[task_idx]
+        name = task["name"]
+        self.events["start_training_task"] = name
+
+    def _show_training_log(self, task_idx):
+        """Show the training log viewer for a task."""
+        self.state = "training_log"
+        if self._overview_refresh_id:
+            self.root.after_cancel(self._overview_refresh_id)
+            self._overview_refresh_id = None
+        self._clear_content()
+
+        task = self.task_configs[task_idx]
+        name = task["name"]
+        self._log_task_name = name
+        training_status = self.task_state.get(name, {}).get("training_status", "not_started")
+
+        badge_text, badge_color = self._training_badge(training_status)
+        self.subtitle_label.config(text=f"Training Log — {name}  {badge_text}")
+
+        card = tk.Frame(self.content_frame, bg=COLORS["card"], padx=20, pady=15)
+        card.pack(expand=True, fill="both")
+
+        # Log text area with scrollbar
+        log_frame = tk.Frame(card, bg=COLORS["card"])
+        log_frame.pack(expand=True, fill="both", pady=(5, 10))
+
+        scrollbar = tk.Scrollbar(log_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self._log_text = tk.Text(
+            log_frame, bg="#0d1117", fg="#c9d1d9",
+            font=("Courier", 11), wrap="word",
+            yscrollcommand=scrollbar.set, state="disabled",
+            borderwidth=0, highlightthickness=0
+        )
+        self._log_text.pack(expand=True, fill="both")
+        scrollbar.config(command=self._log_text.yview)
+
+        # Bottom buttons
+        btn_frame = tk.Frame(card, bg=COLORS["card"])
+        btn_frame.pack(fill="x", pady=(5, 0))
+
+        self._make_button(
+            btn_frame, "← Back", COLORS["button_back"], self._close_training_log,
+            font=self.font_small
+        ).pack(side="left", padx=(0, 10))
+
+        self._load_log_content(name)
+        self._schedule_log_refresh(name)
+
+    def _load_log_content(self, task_name):
+        """Read the training log file and display it."""
+        safe_name = task_name.lower().replace(" ", "_").replace("/", "_")
+        log_path = self._get_data_dir() / safe_name / "train.log"
+
+        if self._log_text is None:
+            return
+
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+
+        if log_path.exists():
+            try:
+                content = log_path.read_text(errors="replace")
+                self._log_text.insert("end", content)
+            except Exception as e:
+                self._log_text.insert("end", f"Error reading log: {e}")
+        else:
+            self._log_text.insert("end", "No training log file yet.\n\nThe log will appear here once training starts.")
+
+        self._log_text.config(state="disabled")
+        self._log_text.see("end")  # Auto-scroll to bottom
+
+    def _schedule_log_refresh(self, task_name):
+        """Refresh log content periodically while viewing."""
+        if self.state != "training_log" or self._log_task_name != task_name:
+            return
+
+        # Also update the subtitle badge
+        training_status = self.task_state.get(task_name, {}).get("training_status", "not_started")
+        badge_text, badge_color = self._training_badge(training_status)
+        self.subtitle_label.config(text=f"Training Log — {task_name}  {badge_text}")
+
+        self._load_log_content(task_name)
+        self._log_refresh_id = self.root.after(3000, lambda: self._schedule_log_refresh(task_name))
+
+    def _close_training_log(self):
+        """Return from log viewer to task overview."""
+        if self._log_refresh_id:
+            self.root.after_cancel(self._log_refresh_id)
+            self._log_refresh_id = None
+        self._log_text = None
+        self._log_task_name = None
+        self._show_task_overview()
 
     # ================================================================
     # Data Collection Screens (idle → recording → review → saving)
@@ -568,7 +732,46 @@ class FaireMultiTaskGUI:
     def _on_reject(self):
         if self.state != "review":
             return
-        self._show_saving("Discarding episode, you can try again.")
+        self._show_failure_reason()
+
+    def _show_failure_reason(self):
+        """Show multiple-choice screen for why the trial failed."""
+        self.state = "failure_reason"
+        self._clear_content()
+        task = self.task_configs[self.current_task]
+        self.subtitle_label.config(text=f"Feedback — {task['name']}")
+
+        card = tk.Frame(self.content_frame, bg=COLORS["card"], padx=40, pady=30)
+        card.pack(expand=True, fill="both")
+
+        tk.Label(
+            card, text="What went wrong?",
+            font=self.font_large, fg=COLORS["text"], bg=COLORS["card"]
+        ).pack(pady=(20, 20))
+
+        reasons = [
+            "Robot did not grab the object",
+            "Robot dropped the object",
+            "Robot moved to the wrong position",
+            "Robot collided with something",
+            "I made a mistake operating the leader arm",
+            "The task took too long",
+            "Other / not sure",
+        ]
+
+        for reason in reasons:
+            self._make_button(
+                card, reason, COLORS["accent"],
+                lambda r=reason: self._on_reason_selected(r),
+                font=self.font_small
+            ).pack(fill="x", pady=4, padx=40)
+
+    def _on_reason_selected(self, reason):
+        """User picked a failure reason."""
+        if self.state != "failure_reason":
+            return
+        self._show_saving(f"Saving failed trial...\nReason: {reason}")
+        self.events["reject_reason"] = reason
         self.events["rerecord_episode"] = True
         self.events["exit_early"] = True
         self.events["episode_accepted"] = False
@@ -590,6 +793,8 @@ class FaireMultiTaskGUI:
         self._cancel_timer()
         if self._overview_refresh_id:
             self.root.after_cancel(self._overview_refresh_id)
+        if self._log_refresh_id:
+            self.root.after_cancel(self._log_refresh_id)
         self.events["stop_recording"] = True
         self.events["exit_early"] = True
         self.root.quit()
@@ -630,6 +835,8 @@ def init_faire_multi_task_gui(task_configs: list[dict], task_state: dict):
         "current_task_name": None,
         "run_policy_task": None,
         "stop_policy": False,
+        "start_training_task": None,
+        "reject_reason": None,
     }
     gui = FaireMultiTaskGUI(events, task_configs, task_state)
     return gui, events

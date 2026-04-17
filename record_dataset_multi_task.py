@@ -12,6 +12,7 @@ Usage:
     python record_dataset_multi_task.py --config my_tasks.json
 """
 
+import copy
 import json
 import shutil
 import subprocess
@@ -107,6 +108,8 @@ def save_task_state(state_path: Path, task_state: dict):
 
 # Cache of open datasets, keyed by task name
 _dataset_cache: dict[str, LeRobotDataset] = {}
+# Separate cache for "bad" datasets
+_bad_dataset_cache: dict[str, LeRobotDataset] = {}
 
 
 def get_or_create_dataset(task_name: str, dataset_features: dict, robot_name: str) -> LeRobotDataset:
@@ -144,6 +147,37 @@ def get_or_create_dataset(task_name: str, dataset_features: dict, robot_name: st
     return dataset
 
 
+def get_or_create_bad_dataset(task_name: str, dataset_features: dict, robot_name: str) -> LeRobotDataset:
+    """Get or create a dataset for failed episodes (stored in <task>_bad folder)."""
+    if task_name in _bad_dataset_cache:
+        return _bad_dataset_cache[task_name]
+
+    safe_name = task_name.lower().replace(" ", "_").replace("/", "_")
+    root = Path(DATA_DIR).expanduser() / f"{safe_name}_bad"
+    repo_id = f"local/{safe_name}_bad"
+
+    episodes_dir = root / "meta" / "episodes"
+    has_saved_episodes = episodes_dir.exists() and any(episodes_dir.glob("*.parquet"))
+
+    if has_saved_episodes:
+        dataset = LeRobotDataset(repo_id=repo_id, root=root)
+    else:
+        if root.exists():
+            shutil.rmtree(root)
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=FPS,
+            root=root,
+            features=dataset_features,
+            robot_type=robot_name,
+            use_videos=True,
+            image_writer_threads=4,
+        )
+
+    _bad_dataset_cache[task_name] = dataset
+    return dataset
+
+
 def recording_thread(robot, teleop_device, events, gui, task_configs, task_state, dataset_features, state_path):
     """
     Main worker thread: waits for GUI signals to collect episodes or run policies.
@@ -157,12 +191,28 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
         while (
             not events["start_episode"]
             and not events["run_policy_task"]
+            and not events["start_training_task"]
             and not events["stop_recording"]
         ):
             time.sleep(0.1)
 
         if events["stop_recording"]:
             break
+
+        # ---- Manual training trigger ----
+        if events["start_training_task"]:
+            task_name = events["start_training_task"]
+            events["start_training_task"] = None
+            task_cfg = next((t for t in task_configs if t["name"] == task_name), None)
+            if task_cfg:
+                ts = task_state.get(task_name, {})
+                if ts.get("training_status") not in ("training",):
+                    # Finalize dataset so parquet is flushed before training reads it
+                    if task_name in _dataset_cache:
+                        _dataset_cache[task_name].finalize()
+                        _dataset_cache.pop(task_name)
+                    _start_background_training(task_name, task_cfg, task_state, state_path)
+            continue
 
         # ---- Policy execution ----
         if events["run_policy_task"]:
@@ -221,10 +271,39 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
             break
 
         if events["rerecord_episode"]:
-            log_say("Discarding episode")
+            reject_reason = events.get("reject_reason")
+            events["reject_reason"] = None
+
+            if reject_reason:
+                # Save the failed episode to a separate _bad dataset.
+                log_say(f"Saving failed episode for: {task_name} (reason: {reject_reason})")
+                buffered = copy.deepcopy(dataset.episode_buffer)
+
+                bad_dataset = get_or_create_bad_dataset(task_name, dataset_features, robot.name)
+                bad_task_label = f"{task_name} | {reject_reason}"
+                buffered["task"] = [bad_task_label] * buffered["size"]
+                bad_ep_idx = bad_dataset.meta.total_episodes
+                buffered["episode_index"] = bad_ep_idx
+
+                # Copy temporary images from original dataset dir to bad dataset dir.
+                # save_episode encodes video from <root>/images/<key>/episode-NNNNNN/
+                src_ep_idx = dataset.episode_buffer["episode_index"]
+                for img_key in dataset.meta.video_keys + list(dataset.meta.image_keys):
+                    src_dir = dataset.root / f"images/{img_key}/episode-{src_ep_idx:06d}"
+                    dst_dir = bad_dataset.root / f"images/{img_key}/episode-{bad_ep_idx:06d}"
+                    if src_dir.exists():
+                        shutil.copytree(str(src_dir), str(dst_dir), dirs_exist_ok=True)
+
+                bad_dataset.save_episode(episode_data=buffered)
+
+                dataset.clear_episode_buffer()
+                log_say(f"Failed episode saved to _bad dataset for: {task_name}")
+            else:
+                log_say("Discarding episode")
+                dataset.clear_episode_buffer()
+
             events["rerecord_episode"] = False
             events["exit_early"] = False
-            dataset.clear_episode_buffer()
             gui.notify_episode_discarded()
             continue
 
@@ -255,6 +334,9 @@ def recording_thread(robot, teleop_device, events, gui, task_configs, task_state
     for ds in _dataset_cache.values():
         ds.finalize()
     _dataset_cache.clear()
+    for ds in _bad_dataset_cache.values():
+        ds.finalize()
+    _bad_dataset_cache.clear()
 
     # Cleanup
     log_say("Stopping...")
@@ -467,7 +549,8 @@ def _remote_training_worker(task_name: str, task_cfg: dict, task_state: dict, st
         if status == "completed":
             break
         elif status == "failed":
-            log_say(f"Remote training failed for: {task_name}")
+            error_msg = resp.json().get("error", "unknown error")
+            log_say(f"Remote training failed for: {task_name} — {error_msg}")
             ts["training_status"] = "failed"
             ts.pop("remote_job_id", None)
             save_task_state(state_path, task_state)
